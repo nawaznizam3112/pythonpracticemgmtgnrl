@@ -11,6 +11,7 @@ import hmac
 import io
 import json
 import os
+import re
 import secrets
 import sqlite3
 import urllib.parse
@@ -65,6 +66,8 @@ CREATE TABLE IF NOT EXISTS ai_reports(id INTEGER PRIMARY KEY, patient_id INTEGER
 CREATE TABLE IF NOT EXISTS message_log(id INTEGER PRIMARY KEY, patient_id INTEGER, channel TEXT, to_number TEXT, body TEXT,
   status TEXT, detail TEXT, sent_at TEXT, sent_by TEXT);
 CREATE TABLE IF NOT EXISTS agent_log(id INTEGER PRIMARY KEY, user TEXT, role TEXT, prompt TEXT, tools TEXT, answer TEXT, created_at TEXT);
+CREATE TABLE IF NOT EXISTS scribe_log(id INTEGER PRIMARY KEY, patient_id INTEGER, doctor_id INTEGER, visit_id INTEGER, source TEXT,
+  transcript TEXT, ai_draft TEXT, created_at TEXT);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY, user TEXT, action TEXT, detail TEXT, ts TEXT);
 """
@@ -778,28 +781,8 @@ def page_consultation():
         ordered = st.multiselect("Order lab tests", list(tmap), format_func=tmap.get)
         fu = st.date_input("Follow-up date (optional)", value=None)
         if st.form_submit_button("Save consultation"):
-            vid = run("INSERT INTO visits(patient_id,doctor_id,appointment_id,complaint,subjective,objective,assessment,plan,diagnosis,"
-                      "follow_up,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                      (pid, u["id"], aid or None, complaint, subj, obj, assess, plan, diag, fu.isoformat() if fu else None, now()))
-            inv = get_invoice(pid, vid)
-            add_item(inv, f"Consultation – {u['full_name']}", 1, float(S("consult_fee", "0")))
-            items = rx[rx["medicine"].astype(str).str.strip() != ""]
-            if len(items):
-                rid = run("INSERT INTO prescriptions(visit_id,patient_id,doctor_id,status,created_at) VALUES(?,?,?, 'Pending',?)",
-                          (vid, pid, u["id"], now()))
-                for _, r in items.iterrows():
-                    run("INSERT INTO prescription_items(prescription_id,medicine,dosage,frequency,duration,instructions,qty) "
-                        "VALUES(?,?,?,?,?,?,?)", (rid, r["medicine"], r["dosage"], r["frequency"], r["duration"], r["instructions"],
-                                                   int(r["qty"] or 1)))
-            for tid in ordered:
-                run("INSERT INTO lab_orders(patient_id,visit_id,doctor_id,test_id,status,ordered_at) VALUES(?,?,?,?, 'Ordered',?)",
-                    (pid, vid, u["id"], tid, now()))
-                price = next(t["price"] for t in tests if t["id"] == tid)
-                add_item(inv, f"Lab: {tmap[tid]}", 1, price)
-            if aid:
-                run("UPDATE appointments SET status='Completed' WHERE id=?", (aid,))
-            refresh_invoice_status(inv)
-            audit("consultation_saved", f"visit {vid}")
+            save_consultation(pid, u, aid or None, dict(complaint=complaint, subjective=subj, objective=obj, assessment=assess,
+                                                        plan=plan, diagnosis=diag), rx, ordered, fu)
             st.session_state["rx_n"] = n + 1
             st.toast("Consultation saved")
             st.rerun()
@@ -1174,7 +1157,7 @@ def page_admin():
         exports = {
             "patients": "SELECT * FROM patients", "appointments": "SELECT * FROM appointments", "visits": "SELECT * FROM visits",
             "invoices": "SELECT * FROM invoices", "payments": "SELECT * FROM payments", "inventory": "SELECT * FROM inventory",
-            "message_log": "SELECT * FROM message_log", "agent_log": "SELECT * FROM agent_log", "audit_log": "SELECT * FROM audit_log"}
+            "message_log": "SELECT * FROM message_log", "agent_log": "SELECT * FROM agent_log", "scribe_log": "SELECT * FROM scribe_log", "audit_log": "SELECT * FROM audit_log"}
         tb = st.selectbox("Export table to CSV", list(exports))
         st.download_button("Download CSV", frame(exports[tb]).to_csv(index=False), f"{tb}.csv", "text/csv")
         st.divider()
@@ -1568,6 +1551,233 @@ def page_agent():
             st.dataframe(frame("SELECT created_at, user, role, prompt, tools FROM agent_log ORDER BY id DESC LIMIT 200"), hide_index=True)
 
 
+# ───────────────────────────── AI consultation scribe ─────────────────────────────
+ALLERGY_CLASSES = {
+    "penicillin": ["penicillin", "amoxicillin", "ampicillin", "cloxacillin", "piperacillin", "augmentin", "amoxyclav", "clavulan"],
+    "sulfa": ["sulfa", "sulpha", "sulfamethoxazole", "cotrimoxazole", "co-trimoxazole", "bactrim"],
+    "sulpha": ["sulfa", "sulpha", "sulfamethoxazole", "cotrimoxazole", "co-trimoxazole", "bactrim"],
+    "nsaid": ["ibuprofen", "diclofenac", "naproxen", "aspirin", "ketorolac", "aceclofenac", "nimesulide", "etoricoxib"],
+    "cephalosporin": ["cef", "ceph"],
+    "macrolide": ["azithromycin", "clarithromycin", "erythromycin"],
+}
+RX_COLS = ["medicine", "dosage", "frequency", "duration", "instructions", "qty"]
+
+
+def save_consultation(pid, doctor, aid, note, rx, test_ids, follow_up):
+    """Persist a visit, prescription, lab orders and invoice lines. Shared by the manual form and the AI scribe."""
+    vid = run("INSERT INTO visits(patient_id,doctor_id,appointment_id,complaint,subjective,objective,assessment,plan,diagnosis,"
+              "follow_up,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+              (pid, doctor["id"], aid, note["complaint"], note["subjective"], note["objective"], note["assessment"], note["plan"],
+               note["diagnosis"], follow_up.isoformat() if follow_up else None, now()))
+    inv = get_invoice(pid, vid)
+    add_item(inv, f"Consultation – {doctor['full_name']}", 1, float(S("consult_fee", "0")))
+    items = rx[rx["medicine"].astype(str).str.strip() != ""]
+    if len(items):
+        rid = run("INSERT INTO prescriptions(visit_id,patient_id,doctor_id,status,created_at) VALUES(?,?,?, 'Pending',?)",
+                  (vid, pid, doctor["id"], now()))
+        for _, r in items.iterrows():
+            run("INSERT INTO prescription_items(prescription_id,medicine,dosage,frequency,duration,instructions,qty) VALUES(?,?,?,?,?,?,?)",
+                (rid, r["medicine"], r["dosage"], r["frequency"], r["duration"], r["instructions"], int(r["qty"] or 1)))
+    tests = {t["id"]: t for t in rows("SELECT id, name, price FROM lab_tests")}
+    for tid in test_ids:
+        run("INSERT INTO lab_orders(patient_id,visit_id,doctor_id,test_id,status,ordered_at) VALUES(?,?,?,?, 'Ordered',?)",
+            (pid, vid, doctor["id"], tid, now()))
+        add_item(inv, f"Lab: {tests[tid]['name']}", 1, tests[tid]["price"])
+    if aid:
+        run("UPDATE appointments SET status='Completed' WHERE id=?", (aid,))
+    refresh_invoice_status(inv)
+    audit("consultation_saved", f"visit {vid}")
+    return vid
+
+
+def scribe_checks(pid, rx):
+    """Deterministic safety checks (no AI): allergy conflicts, incomplete lines, recent duplicates, stock."""
+    p = one("SELECT allergies FROM patients WHERE id=?", (pid,))
+    toks = [t.strip() for t in re.split(r"[,;/\n]| and ", (p["allergies"] or "").lower()) if len(t.strip()) >= 3]
+    recent = {r["m"] for r in rows("SELECT DISTINCT lower(i.medicine) m FROM prescription_items i JOIN prescriptions r "
+                                   "ON r.id=i.prescription_id WHERE r.patient_id=? AND r.created_at>=date('now','-30 day')", (pid,))}
+    stock = {r["medicine"].lower() for r in rows("SELECT medicine FROM inventory")}
+    errs, warns, infos = [], [], []
+    for _, r in rx.iterrows():
+        med = str(r["medicine"] or "").strip()
+        if not med:
+            continue
+        low = med.lower()
+        for tok in toks:
+            names = {tok}
+            for key, drugs in ALLERGY_CLASSES.items():
+                if key in tok:
+                    names.update(drugs)
+            if any(n in low for n in names):
+                errs.append(f"ALLERGY: **{med}** may conflict with the recorded allergy “{tok}”.")
+        if not (str(r["dosage"] or "").strip() and str(r["frequency"] or "").strip() and str(r["duration"] or "").strip()):
+            warns.append(f"{med}: dosage, frequency or duration is missing.")
+        if low in recent:
+            infos.append(f"{med} was already prescribed in the last 30 days.")
+        if stock and low not in stock:
+            infos.append(f"{med} is not in the pharmacy inventory.")
+    return errs, warns, infos
+
+
+def scribe_extract(audio, mime, transcript, pid, doctor_name, lang):
+    from google import genai
+    from google.genai import types
+    key = get_gemini_key()
+    if not key:
+        raise RuntimeError("Gemini API key missing. Add GEMINI_API_KEY in Streamlit secrets or Admin → AI settings.")
+    p = one("SELECT dob, gender, allergies, history FROM patients WHERE id=?", (pid,))
+    tests = rows("SELECT id, name FROM lab_tests ORDER BY name")
+    system = (
+        f"You are a clinical scribe for {doctor_name}. Convert the doctor–patient consultation (audio that may mix Hindi, Kannada, Tamil, "
+        f"English, etc., or a transcript) into a structured note written in {lang}.\n"
+        "STRICT RULES: record only what was actually said or clearly observed; never add diagnoses, medicines, doses, tests or advice the "
+        "doctor did not state; if something is unclear or missing leave the field empty and add an entry to flags. "
+        "subjective = patient-reported history; objective = examination findings/vitals mentioned; assessment = doctor's impression; "
+        "diagnosis = short label; plan = advice/counselling given. prescriptions = only medicines the doctor prescribed, with dosage, "
+        "frequency (e.g. 1-0-1 or TDS), duration, instructions and qty (total units if stated or clearly computable, else 1). "
+        "lab_tests = tests the doctor ordered, using these exact catalogue names when one matches: "
+        + "; ".join(t["name"] for t in tests) + ". follow_up_days = days until follow-up if stated, else 0. "
+        "transcript = a cleaned transcript translated to English, labelled Doctor:/Patient:. flags = ambiguities, unstated doses, "
+        "possible safety concerns (for example an allergy conflict), or information you could not hear.\n"
+        f"Patient context (for flag checks only): age {age(p['dob'])}, {p['gender']}, allergies: {p['allergies'] or 'none recorded'}, "
+        f"history: {p['history'] or 'none recorded'}.")
+    T = types.Type
+    strs = {k: types.Schema(type=T.STRING) for k in ("medicine", "dosage", "frequency", "duration", "instructions")}
+    rx_schema = types.Schema(type=T.OBJECT, properties={**strs, "qty": types.Schema(type=T.INTEGER)},
+                             required=["medicine", "dosage", "frequency", "duration", "instructions", "qty"])
+    fields = ["transcript", "complaint", "subjective", "objective", "assessment", "plan", "diagnosis"]
+    schema = types.Schema(
+        type=T.OBJECT,
+        properties={**{k: types.Schema(type=T.STRING) for k in fields},
+                    "follow_up_days": types.Schema(type=T.INTEGER),
+                    "prescriptions": types.Schema(type=T.ARRAY, items=rx_schema),
+                    "lab_tests": types.Schema(type=T.ARRAY, items=types.Schema(type=T.STRING)),
+                    "flags": types.Schema(type=T.ARRAY, items=types.Schema(type=T.STRING))},
+        required=fields + ["follow_up_days", "prescriptions", "lab_tests", "flags"])
+    parts = []
+    if audio:
+        parts.append(types.Part.from_bytes(data=audio, mime_type=mime))
+    if transcript:
+        parts.append(f"Consultation transcript:\n{transcript}")
+    parts.append("Create the structured consultation note.")
+    resp = genai.Client(api_key=key).models.generate_content(
+        model=S("gemini_model"), contents=parts,
+        config=types.GenerateContentConfig(system_instruction=system, temperature=0.1, response_mime_type="application/json",
+                                           response_schema=schema))
+    data = json.loads(resp.text)
+    note = {k: str(data.get(k) or "") for k in fields}
+    note["follow_up_days"] = int(data.get("follow_up_days") or 0)
+    note["flags"] = [str(f) for f in (data.get("flags") or [])]
+    note["prescriptions"] = [{"medicine": str(r.get("medicine") or ""), "dosage": str(r.get("dosage") or ""),
+                              "frequency": str(r.get("frequency") or ""), "duration": str(r.get("duration") or ""),
+                              "instructions": str(r.get("instructions") or ""), "qty": int(r.get("qty") or 1)}
+                             for r in (data.get("prescriptions") or []) if str(r.get("medicine") or "").strip()]
+    ids = []
+    for name in data.get("lab_tests") or []:
+        m = next((t for t in tests if t["name"].lower() == str(name).lower()), None) or \
+            next((t for t in tests if str(name).lower() in t["name"].lower() or t["name"].lower() in str(name).lower()), None)
+        if m and m["id"] not in ids:
+            ids.append(m["id"])
+        elif not m:
+            note["flags"].append(f"Lab test “{name}” was mentioned but is not in the catalogue – add it manually if needed.")
+    note["test_ids"] = ids
+    return note
+
+
+def render_scribe_draft(d):
+    note, k, pid, u = d["note"], d["id"], d["pid"], me()
+    st.divider()
+    st.subheader("Draft note – review and edit before saving")
+    if note["flags"]:
+        st.warning("**AI flags – please check**\n" + "\n".join(f"- {f}" for f in note["flags"]))
+    with st.expander("Transcript (verify against what was said)"):
+        st.write(note["transcript"] or "—")
+    complaint = st.text_input("Chief complaint", note["complaint"], key=f"c{k}")
+    c1, c2 = st.columns(2)
+    subj = c1.text_area("Subjective", note["subjective"], key=f"s{k}", height=140)
+    obj = c2.text_area("Objective", note["objective"], key=f"o{k}", height=140)
+    assess = c1.text_area("Assessment", note["assessment"], key=f"a{k}", height=110)
+    plan = c2.text_area("Plan / advice", note["plan"], key=f"p{k}", height=110)
+    diag = st.text_input("Diagnosis", note["diagnosis"], key=f"d{k}")
+    st.markdown("**Prescription**")
+    base = pd.DataFrame(note["prescriptions"] or [{c: ("" if c != "qty" else 1) for c in RX_COLS}], columns=RX_COLS)
+    rx = st.data_editor(base, num_rows="dynamic", key=f"rx{k}")
+    tmap = {t["id"]: t["name"] for t in rows("SELECT id, name FROM lab_tests ORDER BY name")}
+    ordered = st.multiselect("Lab tests to order", list(tmap), default=note["test_ids"], format_func=tmap.get, key=f"lt{k}")
+    fu = st.date_input("Follow-up date", value=(dt.date.today() + dt.timedelta(days=note["follow_up_days"])) if note["follow_up_days"] > 0
+                       else None, key=f"fu{k}")
+    errs, warns, infos = scribe_checks(pid, rx)
+    for e in errs:
+        st.error(e)
+    for w in warns:
+        st.warning(w)
+    for i in infos:
+        st.info(i)
+    ack = st.checkbox("I have reviewed the allergy alerts and accept responsibility for this prescription", key=f"ack{k}") if errs else True
+    attest = st.checkbox("I have reviewed this note and confirm it is accurate and complete", key=f"at{k}")
+    b1, b2, _ = st.columns([1, 1, 3])
+    if b1.button("✅ Sign & save", type="primary", disabled=not (attest and ack), key=f"sv{k}"):
+        final = dict(complaint=complaint, subjective=subj, objective=obj, assessment=assess, plan=plan, diagnosis=diag)
+        vid = save_consultation(pid, u, d["aid"], final, rx, ordered, fu)
+        run("INSERT INTO scribe_log(patient_id,doctor_id,visit_id,source,transcript,ai_draft,created_at) VALUES(?,?,?,?,?,?,?)",
+            (pid, u["id"], vid, d["source"], note["transcript"], json.dumps({x: note[x] for x in note if x != "transcript"}), now()))
+        audit("scribe_saved", f"visit {vid}")
+        st.session_state.pop("scribe", None)
+        st.toast("Consultation saved from AI scribe draft")
+        st.rerun()
+    if b2.button("Discard draft", key=f"dc{k}"):
+        st.session_state.pop("scribe", None)
+        st.rerun()
+
+
+def page_scribe():
+    st.header("🎙️ AI Consultation Scribe")
+    st.caption("Record or upload the consultation → Gemini drafts the SOAP note, prescription and lab orders → you review, edit and sign. "
+               "Nothing is saved until you sign. Audio is processed but never stored; only the transcript is kept for the audit trail.")
+    pid = patient_picker("Patient", "sc_pt")
+    if not pid:
+        return
+    p = one("SELECT * FROM patients WHERE id=?", (pid,))
+    if p["allergies"]:
+        st.error(f"⚠️ Allergies: {p['allergies']}")
+    appts = rows("SELECT id, appt_date, appt_time, reason FROM appointments WHERE patient_id=? AND status IN "
+                 "('Scheduled','Checked-in','In consultation') ORDER BY appt_date", (pid,))
+    amap = {0: "— walk-in / no appointment —"}
+    amap.update({a["id"]: f"{a['appt_date']} {a['appt_time']} · {a['reason'] or ''}" for a in appts})
+    c1, c2 = st.columns(2)
+    aid = c1.selectbox("Linked appointment", list(amap), format_func=amap.get)
+    lang = c2.selectbox("Write the note in", ["English", "Hindi", "Kannada", "Tamil", "Telugu"])
+    consent = st.checkbox("The patient has consented to AI-assisted note-taking for this consultation")
+    src = st.radio("Input", ["🎙️ Record now", "Upload audio file", "Paste transcript"], horizontal=True)
+    audio, mime, text = None, None, None
+    if src.startswith("🎙️"):
+        a = st.audio_input("Record the consultation")
+        if a:
+            audio, mime = a.getvalue(), a.type or "audio/wav"
+    elif src.startswith("Upload"):
+        f = st.file_uploader("Audio (≈ up to 15 minutes)", type=["wav", "mp3", "m4a", "ogg", "webm", "flac", "aac"])
+        if f:
+            audio, mime = f.getvalue(), f.type or "audio/mpeg"
+    else:
+        text = st.text_area("Transcript", height=200, placeholder="Doctor: What brings you in today?\nPatient: …")
+    if st.button("Generate draft note", type="primary", disabled=not (consent and (audio or (text and text.strip())))):
+        try:
+            with st.spinner("Listening and drafting the note…"):
+                note = scribe_extract(audio, mime, text, pid, me()["full_name"], lang)
+            st.session_state["scribe"] = dict(id=secrets.token_hex(4), pid=pid, aid=aid or None, note=note,
+                                              source="audio" if audio else "text")
+        except Exception as e:
+            st.error(f"Could not generate the note: {e}")
+    d = st.session_state.get("scribe")
+    if d and d["pid"] == pid:
+        render_scribe_draft(d)
+    elif d:
+        st.info("A draft for another patient is open. Switch back to that patient or discard it.")
+        if st.button("Discard other draft"):
+            st.session_state.pop("scribe", None)
+            st.rerun()
+
+
 def reminder_sender(items, key):
     if not items:
         st.info("Nothing to send for this selection.")
@@ -1669,6 +1879,7 @@ PAGES = {
     "📅 Appointments": (page_appointments, ["admin", "doctor", "nurse", "receptionist"]),
     "🩺 Vitals & Triage": (page_vitals, ["admin", "nurse", "doctor"]),
     "👨‍⚕️ Consultation": (page_consultation, ["admin", "doctor"]),
+    "🎙️ AI Scribe": (page_scribe, ["admin", "doctor"]),
     "🧪 Laboratory": (page_lab, ["admin", "doctor", "nurse", "lab"]),
     "💊 Pharmacy": (page_pharmacy, ["admin", "pharmacist", "doctor"]),
     "💳 Billing": (page_billing, ["admin", "billing", "receptionist"]),
