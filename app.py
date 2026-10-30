@@ -12,7 +12,9 @@ import io
 import os
 import secrets
 import sqlite3
+import urllib.parse
 import wave
+from xml.sax.saxutils import escape
 
 import pandas as pd
 import streamlit as st
@@ -59,6 +61,8 @@ CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY, invoice_id INTEGER, 
 CREATE TABLE IF NOT EXISTS ai_reports(id INTEGER PRIMARY KEY, patient_id INTEGER, requested_by TEXT, requester_role TEXT,
   source_name TEXT, language TEXT, doctor_name TEXT, explanation TEXT, spoken_script TEXT, audio BLOB, audio_mime TEXT,
   approved INTEGER DEFAULT 0, created_at TEXT);
+CREATE TABLE IF NOT EXISTS message_log(id INTEGER PRIMARY KEY, patient_id INTEGER, channel TEXT, to_number TEXT, body TEXT,
+  status TEXT, detail TEXT, sent_at TEXT, sent_by TEXT);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY, user TEXT, action TEXT, detail TEXT, ts TEXT);
 """
@@ -67,6 +71,11 @@ DEFAULT_SETTINGS = {
     "clinic_name": "MediCore Clinic", "clinic_address": "12 Health Street, Bengaluru", "clinic_phone": "+91 80 0000 0000",
     "consult_fee": "500", "tax_pct": "0", "currency": "₹",
     "gemini_model": "gemini-2.5-flash", "gemini_tts_model": "gemini-2.5-flash-preview-tts",
+    "default_cc": "+91", "auto_confirm": "0", "auto_channel": "WhatsApp",
+    "tpl_booking": "Hello {name}, your appointment with {doctor} is confirmed for {date} at {time}. - {clinic}, {clinic_phone}",
+    "tpl_appt": "Hello {name}, reminder: you have an appointment with {doctor} on {date} at {time} at {clinic}. Please call {clinic_phone} to reschedule.",
+    "tpl_due": "Hello {name}, invoice {number} at {clinic} has a pending balance of {amount}. Please pay at your earliest convenience. Thank you.",
+    "tpl_followup": "Hello {name}, {doctor} has advised a follow-up visit on {date}. Call {clinic_phone} to book a slot. - {clinic}",
 }
 DEFAULT_TESTS = [("Complete Blood Count (CBC)", 350, "Hb 12-16 g/dL; WBC 4-11 x10^3/uL"),
                  ("Fasting Blood Sugar", 100, "70-100 mg/dL"), ("HbA1c", 450, "< 5.7 %"),
@@ -245,18 +254,189 @@ def refresh_invoice_status(inv_id):
     run("UPDATE invoices SET status=? WHERE id=?", (status, inv_id))
 
 
-def invoice_html(inv_id):
+# ───────────────────────────── PDF documents ─────────────────────────────
+def _cur():
+    c = S("currency", "₹")
+    return {"₹": "Rs. "}.get(c, c)  # built-in PDF fonts have no rupee glyph
+
+
+def _pdf_head(title):
+    from reportlab.lib import colors
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.platypus import HRFlowable, Paragraph, Spacer
+    ss = getSampleStyleSheet()
+    h = ParagraphStyle("h", parent=ss["Title"], textColor=colors.HexColor("#0F766E"), alignment=0, fontSize=20, spaceAfter=2)
+    return [Paragraph(escape(S("clinic_name")), h),
+            Paragraph(escape(f"{S('clinic_address')} · {S('clinic_phone')}"), ss["Normal"]),
+            Spacer(1, 4), HRFlowable(width="100%", color=colors.HexColor("#0F766E")), Spacer(1, 8),
+            Paragraph(escape(title), ss["Heading2"])]
+
+
+def _pdf_build(story, title):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate
+    buf = io.BytesIO()
+    SimpleDocTemplate(buf, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=16 * mm,
+                      bottomMargin=16 * mm, title=title).build(story)
+    return buf.getvalue()
+
+
+def _grid(data, widths, right_cols=(), header=True):
+    from reportlab.lib import colors
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Table, TableStyle
+    t = Table(data, colWidths=[w * mm for w in widths], repeatRows=1 if header else 0)
+    st_ = [("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CBD5E1")), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+           ("FONTSIZE", (0, 0), (-1, -1), 9)]
+    if header:
+        st_ += [("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F766E")), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold")]
+    for c in right_cols:
+        st_.append(("ALIGN", (c, 0), (c, -1), "RIGHT"))
+    t.setStyle(TableStyle(st_))
+    return t
+
+
+def invoice_pdf(inv_id):
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Paragraph, Spacer, Table, TableStyle
     inv = one("SELECT i.*, p.full_name, p.code, p.phone FROM invoices i JOIN patients p ON p.id=i.patient_id WHERE i.id=?", (inv_id,))
     items = rows("SELECT * FROM invoice_items WHERE invoice_id=?", (inv_id,))
-    t = inv_totals(inv_id)
-    body = "".join(f"<tr><td>{i['description']}</td><td align=right>{i['qty']:g}</td><td align=right>{i['unit_price']:.2f}</td>"
-                   f"<td align=right>{i['qty'] * i['unit_price']:.2f}</td></tr>" for i in items)
-    return f"""<html><body style="font-family:Arial;max-width:720px;margin:auto">
-<h2>{S('clinic_name')}</h2><p>{S('clinic_address')} · {S('clinic_phone')}</p><hr>
-<h3>Invoice {inv['number']}</h3><p>Date: {inv['created_at']}<br>Patient: {inv['full_name']} ({inv['code']})</p>
-<table width=100% border=1 cellspacing=0 cellpadding=6><tr><th align=left>Description</th><th>Qty</th><th>Rate</th><th>Amount</th></tr>{body}</table>
-<p align=right>Subtotal: {t['sub']:.2f}<br>Discount: {t['disc']:.2f}<br>Tax: {t['tax']:.2f}<br><b>Total: {t['total']:.2f}</b><br>
-Paid: {t['paid']:.2f}<br><b>Balance: {t['bal']:.2f}</b></p><p>Status: {inv['status']}</p></body></html>"""
+    pays = rows("SELECT * FROM payments WHERE invoice_id=? ORDER BY id", (inv_id,))
+    t, c, ss = inv_totals(inv_id), _cur(), getSampleStyleSheet()
+    n = ss["Normal"]
+    story = _pdf_head(f"Invoice {inv['number']}")
+    story += [Paragraph(escape(f"Date: {inv['created_at']}    Status: {inv['status']}"), n),
+              Paragraph(escape(f"Patient: {inv['full_name']} ({inv['code']})    Phone: {inv['phone'] or '-'}"), n), Spacer(1, 10)]
+    data = [["Description", "Qty", "Rate", "Amount"]]
+    data += [[Paragraph(escape(i["description"]), n), f"{i['qty']:g}", f"{i['unit_price']:,.2f}",
+              f"{i['qty'] * i['unit_price']:,.2f}"] for i in items]
+    story += [_grid(data, [88, 18, 34, 34], right_cols=(1, 2, 3)), Spacer(1, 10)]
+    tot = Table([["Subtotal", f"{c}{t['sub']:,.2f}"], ["Discount", f"-{c}{t['disc']:,.2f}"], ["Tax", f"{c}{t['tax']:,.2f}"],
+                 ["Total", f"{c}{t['total']:,.2f}"], ["Paid", f"{c}{t['paid']:,.2f}"], ["Balance due", f"{c}{t['bal']:,.2f}"]],
+                colWidths=[40 * mm, 40 * mm], hAlign="RIGHT")
+    tot.setStyle(TableStyle([("ALIGN", (1, 0), (1, -1), "RIGHT"), ("FONTSIZE", (0, 0), (-1, -1), 9),
+                             ("FONTNAME", (0, 3), (-1, 3), "Helvetica-Bold"), ("FONTNAME", (0, 5), (-1, 5), "Helvetica-Bold"),
+                             ("LINEABOVE", (0, 3), (-1, 3), 0.6, colors.HexColor("#0F766E"))]))
+    story.append(tot)
+    if pays:
+        story += [Spacer(1, 12), Paragraph("Payments received", ss["Heading3"]),
+                  _grid([["Date", "Method", "Amount"]] + [[p["paid_at"], p["method"], f"{c}{p['amount']:,.2f}"] for p in pays],
+                        [60, 60, 54], right_cols=(2,))]
+    story += [Spacer(1, 18), Paragraph("Thank you for choosing us. This is a computer-generated invoice.", ss["Italic"])]
+    return _pdf_build(story, inv["number"] or "Invoice")
+
+
+def rx_pdf(rx_id):
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import Paragraph, Spacer
+    rx = one("SELECT r.id, r.created_at, p.full_name, p.code, p.dob, p.gender, p.allergies, u.full_name doc, u.specialization, "
+             "v.diagnosis, v.plan, v.follow_up FROM prescriptions r JOIN patients p ON p.id=r.patient_id "
+             "LEFT JOIN users u ON u.id=r.doctor_id LEFT JOIN visits v ON v.id=r.visit_id WHERE r.id=?", (rx_id,))
+    items = rows("SELECT * FROM prescription_items WHERE prescription_id=?", (rx_id,))
+    ss = getSampleStyleSheet()
+    n = ss["Normal"]
+    story = _pdf_head(f"Prescription #{rx['id']}")
+    story += [Paragraph(escape(f"Date: {rx['created_at']}    Doctor: {rx['doc'] or '-'} ({rx['specialization'] or 'General'})"), n),
+              Paragraph(escape(f"Patient: {rx['full_name']} ({rx['code']})    Age/Sex: {age(rx['dob'])} / {rx['gender']}"), n),
+              Paragraph(escape(f"Allergies: {rx['allergies'] or 'None recorded'}"), n),
+              Paragraph(escape(f"Diagnosis: {rx['diagnosis'] or '-'}"), n), Spacer(1, 10)]
+    P = lambda x: Paragraph(escape(str(x or "")), n)  # noqa: E731
+    data = [["#", "Medicine", "Dosage", "Frequency", "Duration", "Instructions"]]
+    data += [[str(k), P(i["medicine"]), P(i["dosage"]), P(i["frequency"]), P(i["duration"]), P(i["instructions"])]
+             for k, i in enumerate(items, 1)]
+    story.append(_grid(data, [8, 50, 22, 28, 22, 44]))
+    if rx["plan"]:
+        story += [Spacer(1, 10), Paragraph("<b>Advice:</b> " + escape(rx["plan"]), n)]
+    if rx["follow_up"]:
+        story += [Spacer(1, 4), Paragraph("<b>Follow-up:</b> " + escape(rx["follow_up"]), n)]
+    story += [Spacer(1, 40), Paragraph("______________________________<br/>Doctor's signature", n),
+              Spacer(1, 10), Paragraph("Computer-generated prescription. Take medicines only as directed.", ss["Italic"])]
+    return _pdf_build(story, f"Prescription {rx_id}")
+
+
+# ───────────────────────────── SMS / WhatsApp reminders ─────────────────────────────
+class _Safe(dict):
+    def __missing__(self, k):
+        return "{" + k + "}"
+
+
+def render_tpl(key, **kw):
+    tpl = S(key)
+    try:
+        return tpl.format_map(_Safe(clinic=S("clinic_name"), clinic_phone=S("clinic_phone"), **kw))
+    except (ValueError, IndexError):
+        return tpl
+
+
+def secret(name):
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.environ.get(name)
+
+
+def twilio_ready():
+    return bool(secret("TWILIO_ACCOUNT_SID") and secret("TWILIO_AUTH_TOKEN") and (secret("TWILIO_SMS_FROM") or secret("TWILIO_WHATSAPP_FROM")))
+
+
+def norm_phone(ph):
+    ph = (ph or "").strip()
+    digits = "".join(ch for ch in ph if ch.isdigit())
+    if not digits:
+        return None
+    if ph.startswith("+"):
+        return "+" + digits
+    if ph.startswith("00"):
+        return "+" + digits[2:]
+    cc = S("default_cc", "+91")
+    digits = digits.lstrip("0")
+    if len(digits) > 10 and digits.startswith(cc.lstrip("+")):
+        return "+" + digits
+    return cc + digits
+
+
+def send_message(pid, phone, body, channel):
+    """Send via Twilio (SMS or WhatsApp) and log the attempt. Returns (ok, detail)."""
+    to, wa = norm_phone(phone), channel == "WhatsApp"
+    sid, tok = secret("TWILIO_ACCOUNT_SID"), secret("TWILIO_AUTH_TOKEN")
+    sender = secret("TWILIO_WHATSAPP_FROM" if wa else "TWILIO_SMS_FROM")
+    status, detail = "failed", ""
+    if not to:
+        detail = "Invalid or missing phone number"
+    elif not (sid and tok and sender):
+        detail = f"Twilio {'WhatsApp' if wa else 'SMS'} credentials not configured"
+    else:
+        try:
+            import requests
+            pre = "whatsapp:" if wa else ""
+            r = requests.post(f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json", auth=(sid, tok), timeout=20,
+                              data={"From": pre + sender.replace("whatsapp:", ""), "To": pre + to, "Body": body})
+            if r.status_code in (200, 201):
+                status, detail = "sent", r.json().get("sid", "")
+            else:
+                try:
+                    detail = r.json().get("message", r.text[:200])
+                except Exception:
+                    detail = r.text[:200]
+        except Exception as e:
+            detail = str(e)
+    u = st.session_state.get("user")
+    run("INSERT INTO message_log(patient_id,channel,to_number,body,status,detail,sent_at,sent_by) VALUES(?,?,?,?,?,?,?,?)",
+        (pid, channel, to, body, status, detail, now(), u["username"] if u else "system"))
+    return status == "sent", detail
+
+
+def notify_booking(pid, did, d, tm):
+    if S("auto_confirm") != "1":
+        return
+    p, doc = one("SELECT * FROM patients WHERE id=?", (pid,)), one("SELECT full_name FROM users WHERE id=?", (did,))
+    body = render_tpl("tpl_booking", name=p["full_name"], doctor=doc["full_name"], date=d, time=tm)
+    ok, detail = send_message(pid, p["phone"], body, S("auto_channel", "WhatsApp"))
+    st.toast("Confirmation message sent" if ok else f"Confirmation not sent: {detail}")
 
 
 # ───────────────────────────── Gemini: report reading + doctor voice ─────────────────────────────
@@ -426,6 +606,7 @@ def patient_profile(pid):
         for rx in rows("SELECT r.id, r.created_at, r.status, u.full_name doc FROM prescriptions r LEFT JOIN users u ON u.id=r.doctor_id "
                        "WHERE r.patient_id=? ORDER BY r.id DESC", (pid,)):
             with st.expander(f"Rx #{rx['id']} · {rx['created_at']} · {rx['doc']} · {rx['status']}"):
+                st.download_button("⬇️ Prescription PDF", rx_pdf(rx["id"]), f"prescription_{rx['id']}.pdf", "application/pdf", key=f"rxpdf{rx['id']}")
                 st.dataframe(frame("SELECT medicine,dosage,frequency,duration,instructions,qty FROM prescription_items "
                                    "WHERE prescription_id=?", (rx["id"],)), hide_index=True)
     with tabs[4]:
@@ -503,6 +684,7 @@ def page_appointments():
                         run("INSERT INTO appointments(patient_id,doctor_id,appt_date,appt_time,reason,status,created_by,created_at) "
                             "VALUES(?,?,?,?,?,'Scheduled',?,?)", (pid, did, d.isoformat(), tm, reason, u["username"], now()))
                         audit("appointment_book", f"patient {pid}")
+                        notify_booking(pid, did, d.isoformat(), tm)
                         st.success("Appointment booked")
         elif not docs:
             st.warning("Add at least one doctor in Admin → Users.")
@@ -776,7 +958,7 @@ def page_billing():
                     refresh_invoice_status(iid)
                     audit("payment", f"invoice {iid} {amt}")
                     st.rerun()
-            st.download_button("⬇️ Download invoice (HTML – print to PDF)", invoice_html(iid), f"invoice_{iid}.html", "text/html")
+            st.download_button("⬇️ Download invoice PDF", invoice_pdf(iid), f"invoice_{iid}.pdf", "application/pdf")
     with t3:
         c1, c2 = st.columns(2)
         s = c1.date_input("From", dt.date.today().replace(day=1), key="rv1")
@@ -900,6 +1082,7 @@ def page_portal():
     with t2:
         for rx in rows("SELECT id, created_at, status FROM prescriptions WHERE patient_id=? ORDER BY id DESC", (pid,)):
             with st.expander(f"Prescription #{rx['id']} · {rx['created_at']} · {rx['status']}"):
+                st.download_button("⬇️ Download PDF", rx_pdf(rx["id"]), f"prescription_{rx['id']}.pdf", "application/pdf", key=f"prxpdf{rx['id']}")
                 st.dataframe(frame("SELECT medicine,dosage,frequency,duration,instructions FROM prescription_items WHERE prescription_id=?",
                                    (rx["id"],)), hide_index=True)
     with t3:
@@ -910,7 +1093,7 @@ def page_portal():
         for i in rows("SELECT id, number, created_at, status FROM invoices WHERE patient_id=? ORDER BY id DESC", (pid,)):
             t = inv_totals(i["id"])
             st.write(f"**{i['number']}** · {i['created_at']} · {i['status']} · Total {money(t['total'])} · Due {money(t['bal'])}")
-            st.download_button("Download", invoice_html(i["id"]), f"{i['number']}.html", "text/html", key=f"dl{i['id']}")
+            st.download_button("Download PDF", invoice_pdf(i["id"]), f"{i['number']}.pdf", "application/pdf", key=f"dl{i['id']}")
     with t5:
         docs = doctors()
         if docs:
@@ -987,7 +1170,7 @@ def page_admin():
         exports = {
             "patients": "SELECT * FROM patients", "appointments": "SELECT * FROM appointments", "visits": "SELECT * FROM visits",
             "invoices": "SELECT * FROM invoices", "payments": "SELECT * FROM payments", "inventory": "SELECT * FROM inventory",
-            "audit_log": "SELECT * FROM audit_log"}
+            "message_log": "SELECT * FROM message_log", "audit_log": "SELECT * FROM audit_log"}
         tb = st.selectbox("Export table to CSV", list(exports))
         st.download_button("Download CSV", frame(exports[tb]).to_csv(index=False), f"{tb}.csv", "text/csv")
         st.divider()
@@ -1009,6 +1192,100 @@ def page_admin():
 
 
 # ───────────────────────────── routing & auth ─────────────────────────────
+def reminder_sender(items, key):
+    if not items:
+        st.info("Nothing to send for this selection.")
+        return
+    df = pd.DataFrame([{"Send": True, "Patient": i["name"], "Phone": i["phone"] or "", "Message": i["body"]} for i in items])
+    ed = st.data_editor(df, key=f"rm_{key}", disabled=["Patient"], column_config={"Message": st.column_config.TextColumn(width="large")})
+    ch = st.radio("Channel", ["WhatsApp", "SMS"], horizontal=True, key=f"ch_{key}")
+    if st.button(f"Send {int(ed['Send'].sum())} message(s) via Twilio", key=f"sb_{key}", type="primary"):
+        ok, fails = 0, []
+        for idx, r in ed.iterrows():
+            if r["Send"]:
+                good, detail = send_message(items[idx]["patient_id"], r["Phone"], r["Message"], ch)
+                if good:
+                    ok += 1
+                else:
+                    fails.append(f"{r['Patient']}: {detail}")
+        if ok:
+            st.success(f"{ok} message(s) sent")
+        for f in fails:
+            st.error(f)
+    with st.expander("No Twilio? Open click-to-chat links (you press send)"):
+        for idx, r in ed[ed["Send"]].iterrows():
+            to = norm_phone(r["Phone"])
+            if not to:
+                st.caption(f"{r['Patient']}: no valid phone number")
+                continue
+            q = urllib.parse.quote(r["Message"])
+            a, b, c = st.columns([3, 1, 1])
+            a.write(r["Patient"])
+            b.link_button("WhatsApp", f"https://wa.me/{to.lstrip('+')}?text={q}", key=f"wa_{key}_{idx}")
+            c.link_button("SMS", f"sms:{to}?body={q}", key=f"sms_{key}_{idx}")
+
+
+def page_reminders():
+    st.header("🔔 Reminders (SMS / WhatsApp)")
+    if twilio_ready():
+        st.success("Twilio is configured – messages are sent automatically.")
+    else:
+        st.info("Twilio is not configured. You can still use the click-to-chat links under each list. "
+                "Add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN and TWILIO_SMS_FROM / TWILIO_WHATSAPP_FROM in secrets to send directly.")
+    t1, t2, t3, t4 = st.tabs(["Appointments", "Payment dues", "Follow-ups", "Templates, test & log"])
+    with t1:
+        d = st.date_input("Appointments on", dt.date.today() + dt.timedelta(days=1), key="rem_d")
+        ap = rows("SELECT a.patient_id, a.appt_date, a.appt_time, p.full_name, p.phone, u.full_name doc FROM appointments a "
+                  "JOIN patients p ON p.id=a.patient_id LEFT JOIN users u ON u.id=a.doctor_id "
+                  "WHERE a.appt_date=? AND a.status IN ('Scheduled','Requested') ORDER BY a.appt_time", (d.isoformat(),))
+        reminder_sender([dict(patient_id=a["patient_id"], name=a["full_name"], phone=a["phone"],
+                              body=render_tpl("tpl_appt", name=a["full_name"], doctor=a["doc"] or "the doctor",
+                                              date=a["appt_date"], time=a["appt_time"])) for a in ap], "appt")
+    with t2:
+        items = []
+        for i in rows("SELECT i.id, i.number, i.patient_id, p.full_name, p.phone FROM invoices i JOIN patients p ON p.id=i.patient_id "
+                      "WHERE i.status!='Paid'"):
+            t = inv_totals(i["id"])
+            if t["total"] > 0 and t["bal"] > 0.005:
+                items.append(dict(patient_id=i["patient_id"], name=i["full_name"], phone=i["phone"],
+                                  body=render_tpl("tpl_due", name=i["full_name"], number=i["number"], amount=money(t["bal"]))))
+        reminder_sender(items, "due")
+    with t3:
+        n = st.slider("Follow-ups due within (days)", 1, 14, 3)
+        fu = rows("SELECT v.follow_up, v.patient_id, p.full_name, p.phone, u.full_name doc FROM visits v JOIN patients p "
+                  "ON p.id=v.patient_id LEFT JOIN users u ON u.id=v.doctor_id WHERE v.follow_up BETWEEN date('now') "
+                  "AND date('now', ?) ORDER BY v.follow_up", (f"+{n} day",))
+        reminder_sender([dict(patient_id=f["patient_id"], name=f["full_name"], phone=f["phone"],
+                              body=render_tpl("tpl_followup", name=f["full_name"], doctor=f["doc"] or "your doctor",
+                                              date=f["follow_up"])) for f in fu], "fu")
+    with t4:
+        with st.form("rem_settings"):
+            st.markdown("**Templates** – placeholders: `{name} {doctor} {date} {time} {number} {amount} {clinic} {clinic_phone}`")
+            keys = {"tpl_booking": "Booking confirmation", "tpl_appt": "Appointment reminder", "tpl_due": "Payment due",
+                    "tpl_followup": "Follow-up reminder"}
+            vals = {k: st.text_area(lbl, S(k), height=80) for k, lbl in keys.items()}
+            c1, c2, c3 = st.columns(3)
+            cc = c1.text_input("Default country code", S("default_cc", "+91"))
+            auto = c2.checkbox("Auto-send confirmation when an appointment is booked", S("auto_confirm") == "1")
+            ach = c3.selectbox("Auto channel", ["WhatsApp", "SMS"], index=0 if S("auto_channel", "WhatsApp") == "WhatsApp" else 1)
+            if st.form_submit_button("Save"):
+                for k, v in vals.items():
+                    set_setting(k, v)
+                set_setting("default_cc", cc)
+                set_setting("auto_confirm", "1" if auto else "0")
+                set_setting("auto_channel", ach)
+                audit("reminder_settings_updated")
+                st.success("Saved")
+        c1, c2, c3 = st.columns([2, 1, 1])
+        tp = c1.text_input("Send a test message to (phone)")
+        tc = c2.selectbox("Channel", ["WhatsApp", "SMS"], key="tst_ch")
+        if c3.button("Send test") and tp:
+            ok, detail = send_message(None, tp, render_tpl("tpl_booking", name="Test", doctor="Dr. Test", date="today", time="now"), tc)
+            st.success("Sent") if ok else st.error(detail)
+        st.dataframe(frame("SELECT sent_at, channel, to_number, status, detail, body, sent_by FROM message_log ORDER BY id DESC LIMIT 300"),
+                     hide_index=True)
+
+
 ALL_STAFF = ["admin", "doctor", "nurse", "receptionist", "lab", "pharmacist", "billing"]
 PAGES = {
     "📊 Dashboard": (page_dashboard, ALL_STAFF),
@@ -1019,6 +1296,7 @@ PAGES = {
     "🧪 Laboratory": (page_lab, ["admin", "doctor", "nurse", "lab"]),
     "💊 Pharmacy": (page_pharmacy, ["admin", "pharmacist", "doctor"]),
     "💳 Billing": (page_billing, ["admin", "billing", "receptionist"]),
+    "🔔 Reminders": (page_reminders, ["admin", "receptionist", "billing"]),
     "🤖 AI Report Reader": (page_ai_reports, ["admin", "doctor", "nurse", "lab", "patient"]),
     "🏠 My Portal": (page_portal, ["patient"]),
     "⚙️ Admin": (page_admin, ["admin"]),
