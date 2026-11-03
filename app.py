@@ -176,8 +176,13 @@ def create_user(username, full_name, role, pw, spec="", email="", phone="", reg_
                " VALUES(?,?,?,?,?,?,?,?,1,?,?)", (username.strip().lower(), full_name, role, h, s, spec, email, phone, now(), reg_no))
 
 
+# st.cache_resource only re-runs when the function's own code or its ARGUMENTS change. Passing a fingerprint of the schema and defaults
+# makes every deploy that adds a table, column default or setting re-run the (idempotent) migration automatically.
+SCHEMA_VERSION = hashlib.md5((SCHEMA + repr(DEFAULT_SETTINGS) + repr(DEFAULT_TESTS)).encode()).hexdigest()
+
+
 @st.cache_resource
-def init_db():
+def init_db(schema_version=SCHEMA_VERSION):
     c = _conn()
     c.executescript(SCHEMA)
     try:
@@ -3808,7 +3813,7 @@ def login_view():
 
 
 def main():
-    init_db()
+    init_db(SCHEMA_VERSION)
     if "user" not in st.session_state:
         login_view()
         return
