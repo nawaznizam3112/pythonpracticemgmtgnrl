@@ -214,6 +214,28 @@ def get_gemini_key():
     return k
 
 
+@st.cache_resource
+def _gemini_client(key):
+    """One long-lived client per API key. Creating a client inline and discarding it lets Python garbage-collect it mid-request, which
+    closes its HTTP connection ("Cannot send a request, as the client has been closed")."""
+    from google import genai
+    return genai.Client(api_key=key)
+
+
+def gen_content(**kw):
+    """generate_content through the shared client; rebuilds the client once if the library reports it was closed."""
+    key = get_gemini_key()
+    if not key:
+        raise RuntimeError("Gemini API key missing. Add GEMINI_API_KEY in Streamlit secrets or Admin → AI settings.")
+    try:
+        return _gemini_client(key).models.generate_content(**kw)
+    except RuntimeError as e:
+        if "closed" not in str(e).lower():
+            raise
+        _gemini_client.clear()
+        return _gemini_client(key).models.generate_content(**kw)
+
+
 # ───────────────────────────── shared helpers ─────────────────────────────
 def me():
     return st.session_state["user"]
@@ -1170,7 +1192,6 @@ def notify_booking(pid, did, d, tm):
 
 # ───────────────────────────── Gemini: report reading + doctor voice ─────────────────────────────
 def explain_report(file_bytes, mime, text, lang, doctor_name, level, ctx):
-    from google import genai
     from google.genai import types
     key = get_gemini_key()
     if not key:
@@ -1190,8 +1211,7 @@ first person as the doctor, warm and reassuring, short sentences, no markdown, n
     if text:
         parts.append(f"Report text:\n{text}")
     parts.append("Please explain this report to the patient.")
-    client = genai.Client(api_key=key)
-    resp = client.models.generate_content(model=S("gemini_model"), contents=parts,
+    resp = gen_content(model=S("gemini_model"), contents=parts,
                                           config=types.GenerateContentConfig(system_instruction=system, temperature=0.3))
     out = resp.text or ""
     if "=====SPOKEN=====" in out:
@@ -1209,10 +1229,8 @@ def tts_gtts(text, lang_code):
 
 
 def tts_gemini(text, voice):
-    from google import genai
     from google.genai import types
-    client = genai.Client(api_key=get_gemini_key())
-    r = client.models.generate_content(
+    r = gen_content(
         model=S("gemini_tts_model"),
         contents="Say in a warm, calm and reassuring tone, like a caring doctor talking to a patient: " + text,
         config=types.GenerateContentConfig(
@@ -2185,7 +2203,6 @@ def agent_dispatch(name, args):
 
 
 def run_agent(prompt, history):
-    from google import genai
     from google.genai import types
     key = get_gemini_key()
     if not key:
@@ -2204,9 +2221,9 @@ def run_agent(prompt, history):
     contents.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
     cfg = types.GenerateContentConfig(system_instruction=system, tools=fns, temperature=0.2,
                                       automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True))
-    client, trace = genai.Client(api_key=key), []
+    trace = []
     for _ in range(AGENT_MAX_STEPS):
-        resp = client.models.generate_content(model=S("gemini_model"), contents=contents, config=cfg)
+        resp = gen_content(model=S("gemini_model"), contents=contents, config=cfg)
         cand = resp.candidates[0]
         parts = (cand.content.parts if cand.content and cand.content.parts else [])
         calls = [p.function_call for p in parts if getattr(p, "function_call", None)]
@@ -2401,7 +2418,6 @@ def scribe_checks(pid, rx):
 
 
 def scribe_extract(audio, mime, transcript, pid, doctor_name, lang):
-    from google import genai
     from google.genai import types
     key = get_gemini_key()
     if not key:
@@ -2441,7 +2457,7 @@ def scribe_extract(audio, mime, transcript, pid, doctor_name, lang):
     if transcript:
         parts.append(f"Consultation transcript:\n{transcript}")
     parts.append("Create the structured consultation note.")
-    resp = genai.Client(api_key=key).models.generate_content(
+    resp = gen_content(
         model=S("gemini_model"), contents=parts,
         config=types.GenerateContentConfig(system_instruction=system, temperature=0.1, response_mime_type="application/json",
                                            response_schema=schema))
@@ -2639,7 +2655,6 @@ def triage_fallback_msg(urg, test):
 
 
 def triage_ai(o, p, prior, meds, text):
-    from google import genai
     from google.genai import types
     key = get_gemini_key()
     if not key:
@@ -2668,7 +2683,7 @@ def triage_ai(o, p, prior, meds, text):
     schema = types.Schema(type=T.OBJECT, properties={**{k: types.Schema(type=T.STRING) for k in fields},
                                                      "considerations": types.Schema(type=T.ARRAY, items=types.Schema(type=T.STRING))},
                           required=fields + ["considerations"])
-    resp = genai.Client(api_key=key).models.generate_content(
+    resp = gen_content(
         model=S("gemini_model"), contents=parts,
         config=types.GenerateContentConfig(system_instruction=system, temperature=0.1, response_mime_type="application/json",
                                            response_schema=schema))
@@ -3158,7 +3173,6 @@ def apply_patient_proposal(p):
 
 
 def run_patient_agent(prompt, history):
-    from google import genai
     from google.genai import types
     key = get_gemini_key()
     if not key:
@@ -3183,9 +3197,9 @@ def run_patient_agent(prompt, history):
     contents.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
     cfg = types.GenerateContentConfig(system_instruction=system, tools=list(PATIENT_TOOLS.values()), temperature=0.2,
                                       automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True))
-    client, used = genai.Client(api_key=key), []
+    used = []
     for _ in range(5):
-        resp = client.models.generate_content(model=S("gemini_model"), contents=contents, config=cfg)
+        resp = gen_content(model=S("gemini_model"), contents=contents, config=cfg)
         cand = resp.candidates[0]
         parts = cand.content.parts if cand.content and cand.content.parts else []
         calls = [p.function_call for p in parts if getattr(p, "function_call", None)]
@@ -3337,7 +3351,6 @@ _INTAKE_LIST = ["pertinent_negatives", "red_flags", "missing_info", "follow_up_q
 
 def intake_extract(audio, mime, text, prior, asked, pid, lang_hint):
     """One analysis round. `prior` = English transcript of earlier rounds; the note always covers the WHOLE intake so far."""
-    from google import genai
     from google.genai import types
     key = get_gemini_key()
     if not key:
@@ -3384,7 +3397,7 @@ def intake_extract(audio, mime, text, prior, asked, pid, lang_hint):
     if text:
         parts.append("Patient's typed description:\n" + text)
     parts.append("Create the structured intake note now.")
-    resp = genai.Client(api_key=key).models.generate_content(
+    resp = gen_content(
         model=S("gemini_model"), contents=parts,
         config=types.GenerateContentConfig(system_instruction=system, temperature=0.1, response_mime_type="application/json",
                                            response_schema=schema))
